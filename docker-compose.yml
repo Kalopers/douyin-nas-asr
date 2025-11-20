@@ -1,0 +1,39 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    container_name: douyin-nas-asr-app
+    restart: unless-stopped
+    ports:
+      - "17650:17650"   # HOST:CONTAINER
+    env_file:
+      - .env
+    volumes:
+      # 源码挂载（开发模式用，生产环境可去掉）
+      - ./src:/app/src
+      - ./utils:/app/utils
+
+      # NAS 路径映射（请根据自己环境修改宿主机路径）
+      - /path/to/your/json_files:/app/data/json
+      - /path/to/your/video_files:/app/data/videos
+      - /path/to/your/image_files:/app/data/images
+
+      # 日志目录
+      - ./logs:/app/logs
+    depends_on:
+      - db
+
+  db:
+    image: postgres:14-alpine
+    container_name: douyin-nas-asr-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

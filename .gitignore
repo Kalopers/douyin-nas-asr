@@ -1,0 +1,43 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs & backups
+logs/
+backup/
+*.log
+
+# Local data (根据项目实际需要调整)
+data/
+data/**
+
+# Container 内映射的数据目录
+/app/data/
+/app/data/json/
+/app/data/videos/
+/app/data/images/
+
+# OS files
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Docker / compose overrides
+docker-compose.override.yml
+*.local.yml
