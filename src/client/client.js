@@ -214,15 +214,165 @@
         return out || str;
     }
 
-    function extractActiveVideoId() {
-        const activeVideo = document.querySelector('div[data-e2e="feed-active-video"]');
-        if (activeVideo) return activeVideo.getAttribute('data-e2e-vid');
-        const urlParams = new URLSearchParams(window.location.search);
-        if (urlParams.get('modal_id')) return urlParams.get('modal_id');
-        const match = window.location.pathname.match(/video\/(\d+)/);
-        if (match) return match[1];
+    // =========================
+    // 视频 ID 解析辅助函数
+    // =========================
+
+    function extractNumberId(str, minLen = 8) {
+        if (!str) return null;
+        const re = new RegExp(`\\d{${minLen},}`);
+        const m = String(str).match(re);
+        return m ? m[0] : null;
+    }
+
+    function findVideoIdInElement(root) {
+        if (!root) return null;
+
+        // 优先找 /video/xxxxxxxxxxxx 这种链接
+        const linkSelectors = [
+            'a[href*="/video/"]',
+            'a[data-e2e="video-link"]',
+        ];
+        for (const sel of linkSelectors) {
+            const a = root.querySelector(sel);
+            if (a) {
+                const href = a.getAttribute('href') || a.href || '';
+                const m = href.match(/\/video\/(\d{8,})/);
+                if (m) {
+                    console.log(`[NAS] ID Source: Anchor Href (${m[1]})`);
+                    return m[1];
+                }
+            }
+        }
+
+        // 常见挂载在元素上的 data-* 属性
+        const attrNames = [
+            'data-e2e-vid',
+            'data-vid',
+            'data-video-id',
+            'data-aweme-id',
+            'data-e2e-aweme-id',
+        ];
+
+        for (const name of attrNames) {
+            if (root.hasAttribute && root.hasAttribute(name)) {
+                const id = extractNumberId(root.getAttribute(name), 8);
+                if (id) {
+                    console.log(`[NAS] ID Source: Element Attribute ${name} (${id})`);
+                    return id;
+                }
+            }
+        }
+
+        // 再从子节点里找这些属性
+        const dataAttrSelector = [
+            '[data-e2e-vid]',
+            '[data-vid]',
+            '[data-video-id]',
+            '[data-aweme-id]',
+            '[data-e2e-aweme-id]',
+        ].join(',');
+
+        const el = root.querySelector(dataAttrSelector);
+        if (el) {
+            for (const name of attrNames) {
+                const id = extractNumberId(el.getAttribute(name), 8);
+                if (id) {
+                    console.log(`[NAS] ID Source: Child Attribute ${name} (${id})`);
+                    return id;
+                }
+            }
+        }
+
         return null;
     }
+
+    // =========================
+    // 合并后的 ID 提取主函数
+    // =========================
+
+    function extractActiveVideoId() {
+        /**
+         * 策略 0: 详情页路径 /video/xxxxxxxxxxxx
+         * 这是最标准、也是最稳定的形式
+         */
+        const detailMatch = window.location.pathname.match(/\/video\/(\d{8,})/);
+        if (detailMatch) {
+            console.log(`[NAS] ID Source: Detail Path (${detailMatch[1]})`);
+            return detailMatch[1];
+        }
+
+        /**
+         * 策略 1: 优先检查 DOM 中被标记为 "Active" 的容器
+         * 抖音通常会给当前播放的容器加 data-e2e="feed-active-video"
+         * 这里的关键是取 dataset.id 而不是 data-e2e-vid
+         */
+        const activeFeed = document.querySelector('[data-e2e="feed-active-video"]');
+        if (activeFeed && activeFeed.dataset && activeFeed.dataset.id) {
+            console.log(`[NAS] ID Source: Active Feed Attribute (${activeFeed.dataset.id})`);
+            return activeFeed.dataset.id;
+        }
+
+        /**
+         * 策略 2: 针对弹窗/滑动模式 (Swiper)
+         * 在个人主页点击视频进入的弹窗模式中，当前卡片通常有 .swiper-slide-active 类
+         */
+        const activeSlide = document.querySelector('.swiper-slide-active');
+        if (activeSlide && activeSlide.dataset && activeSlide.dataset.id) {
+            console.log(`[NAS] ID Source: Swiper Slide Active (${activeSlide.dataset.id})`);
+            return activeSlide.dataset.id;
+        }
+
+        /**
+         * 策略 3: URL 参数检查 (适用于直链访问或弹窗初次打开)
+         * 只有当 URL 包含明确的 modal_id 且看起来像个长数字 ID 时才采信
+         * 且：如果页面上有 swiper-slide-active，就以 DOM 为准，不信 URL
+         * 防止用户在弹窗里划走了，但 URL 没变
+         */
+        const urlParams = new URLSearchParams(window.location.search);
+        const rawModalId = urlParams.get('modal_id');
+        const modalId = rawModalId && /^\d{15,}$/.test(rawModalId) ? rawModalId : null;
+        if (modalId && !activeSlide) {
+            console.log(`[NAS] ID Source: URL Modal Param (${modalId})`);
+            return modalId;
+        }
+
+        /**
+         * 策略 4: 视口中心 + feed-item 卡片 + 链接/属性解析
+         * 适用于各种推荐流 / 搜索流 / 话题流 等
+         */
+        const centerX = window.innerWidth / 2;
+        const centerY = window.innerHeight / 2;
+        let centerEl = document.elementFromPoint(centerX, centerY);
+
+        let feedItem = centerEl && centerEl.closest
+            ? centerEl.closest('[data-e2e="feed-item"], [data-e2e="feed-active-video"]')
+            : null;
+
+        // 找不到就退回到第一个 feed-item
+        if (!feedItem) {
+            feedItem = document.querySelector('[data-e2e="feed-item"], [data-e2e="feed-active-video"]');
+        }
+
+        const idFromFeed = findVideoIdInElement(feedItem);
+        if (idFromFeed) {
+            return idFromFeed;
+        }
+
+        /**
+         * 策略 5: 从整个 URL 中兜底提取一个“像样的长数字”
+         * 某些特殊跳转或新页面结构，用这个作为最后的保险
+         */
+        const fallback = extractNumberId(window.location.href, 8);
+        if (fallback) {
+            console.log(`[NAS] ID Source: URL Fallback (${fallback})`);
+            return fallback;
+        }
+
+        console.warn('[NAS] extractActiveVideoId: failed to resolve video id');
+        return null;
+    }
+
 
     function renderTranscript(videoId, text) {
         let panel = document.getElementById(TRANSCRIPT_PANEL_ID);
