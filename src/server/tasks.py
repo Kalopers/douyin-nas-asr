@@ -94,11 +94,13 @@ class DownloadTask(BaseTask):
             self.job.status = TaskStatus.PROCESSING
             self.set_message(MessageCode.DOWNLOAD_RUNNING)
 
-            files = await self.downloader.download(self.video_id)
+            files, urls = await self.downloader.download(self.video_id)
+            logger.debug(f"DownloadTask got files: {files}, urls: {urls}")
 
-            if files:
+            if files and urls:
                 self.job.status = TaskStatus.COMPLETED
                 self.job.result = [str(f) for f in files]
+                self.job.download_urls = urls
                 self.set_message(MessageCode.DOWNLOAD_SUCCESS)
             else:
                 self.fail(
@@ -138,7 +140,7 @@ class DownloadAndTranscribeTask(BaseTask):
             self.job.status = TaskStatus.PROCESSING
             self.set_message(MessageCode.DOWNLOAD_RUNNING)
 
-            files = await self.downloader.download(self.video_id)
+            files, urls = await self.downloader.download(self.video_id)
 
             if not files:
                 self.fail(
@@ -168,6 +170,7 @@ class DownloadAndTranscribeTask(BaseTask):
             if transcript_result:
                 self.job.status = TaskStatus.COMPLETED
                 self.job.result = transcript_result
+                self.job.download_urls = urls
                 self.set_message(MessageCode.TRANSCRIBE_SUCCESS)
             else:
                 self.fail(

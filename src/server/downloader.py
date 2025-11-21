@@ -44,19 +44,37 @@ def _get_safe_filename(text: str, max_length: int = 60) -> str:
 
 
 def heic_to_jpg(img_path: Path):
-    """将 heic 格式图片转换为 jpg 并删除原文件"""
+    """将 heic 格式图片转换为 jpg 并删除原文件（仅在确认是合法 HEIF 时才转换）"""
     if not img_path.exists() or img_path.suffix.lower() != ".heic":
         return
+
     try:
-        save_dir = img_path.parent
-        name = img_path.stem
+        # 先做一层文件头检查，过滤掉伪装成 .heic 的非 HEIF 文件
+        with img_path.open("rb") as f:
+            header = f.read(12)
+
+        # ISO-BMFF/HEIF 容器前 4 字节是 size，接着 4 字节应该是 'ftyp'
+        if len(header) < 12 or header[4:8] != b"ftyp":
+            logger.warning(
+                f"文件 {img_path.name} 不是有效 HEIF 容器（缺少 ftyp box），"
+                f"疑似非 HEIC 或已损坏，跳过转换。"
+            )
+            return
+
+        # 通过魔数检查之后再交给 pillow_heif 解析
         heif_file = pillow_heif.read_heif(img_path)
         image = Image.frombytes(heif_file.mode, heif_file.size, heif_file.data, "raw")
+
+        save_dir = img_path.parent
+        name = img_path.stem
         jpg_path = save_dir / f"{name}.jpg"
+
         image.save(jpg_path, "JPEG", quality=95)
         img_path.unlink()
         logger.info(f"已将 {img_path.name} 转换为 {jpg_path.name}")
+
     except Exception as e:
+        # 真正的 HEIF 但损坏 / pillow_heif 不支持等情况，在这里统一兜底
         logger.error(f"转换 HEIC 失败: {img_path.name}, 错误: {e}")
 
 
@@ -162,7 +180,7 @@ class DouyinDownloader:
                     f"正在尝试下载链接 #{i + 1}/{len(url_list)}: {save_path.name}"
                 )
                 await self._download_file(url, save_path)
-                return
+                return url
             except Exception as e:
                 logger.warning(f"下载链接 #{i + 1} 失败 (URL: {url}). 错误: {e}")
 
@@ -189,7 +207,7 @@ class DouyinDownloader:
 
     async def _batch_download(
         self, tasks_data: List[Tuple[List[str], Path]]
-    ) -> List[Path]:
+    ) -> Tuple[List[Path], List[Any]]:
         """
         通用并发下载执行器
         Args:
@@ -198,7 +216,7 @@ class DouyinDownloader:
             List of saved paths (including those successfully downloaded or already existing)
         """
         if not tasks_data:
-            return []
+            return [], []
 
         tasks = []
         downloaded_paths = []
@@ -216,11 +234,26 @@ class DouyinDownloader:
                 if isinstance(result, Exception):
                     logger.error(f"下载失败: {save_path.name}, error={result}")
 
-        # 只返回实际存在的文件
-        return [p for p in downloaded_paths if p.exists()]
+        # 同时考虑 HEIC → JPG 的情况
+        final_paths: List[Path] = []
+        for p in downloaded_paths:
+            if p.exists():
+                # 正常情况（video / 未转换的图片）
+                final_paths.append(p)
+                continue
+
+            # 如果是 heic，看看对应 jpg 在不在
+            if p.suffix.lower() == ".heic":
+                jpg_path = p.with_suffix(".jpg")
+                if jpg_path.exists():
+                    final_paths.append(jpg_path)
+
+        return final_paths, results
 
     # --- 核心修改：所有 _process_* 方法现在都返回 List[Path] ---
-    async def _process_single_video(self, aweme_detail: Dict[str, Any]) -> List[Path]:
+    async def _process_single_video(
+        self, aweme_detail: Dict[str, Any]
+    ) -> Tuple[List[Path], List[Any]]:
         """处理类型 4: 单视频"""
         author_name, desc = self._extract_metadata(aweme_detail)
 
@@ -240,7 +273,7 @@ class DouyinDownloader:
     # --- 3. 合并后的图集/混合处理 (The Unifier) ---
     async def _process_gallery(
         self, aweme_detail: Dict[str, Any], is_mixed: bool = False
-    ) -> List[Path]:
+    ) -> Tuple[List[Path], List[Any]]:
         """
         统一处理类型 2 (纯图文) 和 42 (混合媒体)
         本质上都是遍历 images 列表，只是混合模式下需要判断每个 item 是视频还是图片。
@@ -268,12 +301,14 @@ class DouyinDownloader:
             if is_mixed and video_urls:
                 # 是视频
                 file_name = f"video_{i + 1:02d}.mp4"
+                logger.debug(f"发现混合媒体中的视频，准备下载: {file_name}")
                 download_tasks.append((video_urls, save_dir / file_name))
             else:
                 # 是图片 (兜底)
                 img_urls = item.get("url_list")
                 if img_urls:
                     file_name = f"image_{i + 1:02d}.heic"
+                    logger.debug(f"准备下载图片: {file_name}")
                     download_tasks.append((img_urls, save_dir / file_name))
 
         logger.info(

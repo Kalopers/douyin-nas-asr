@@ -66,7 +66,8 @@ class JobInfo(BaseModel):
     status: TaskStatus
     video_id: str
     message_code: Optional[MessageCode] = None
-    message: str = ""
+    download_urls: Optional[List[str]] = None
+    message: Optional[str] = ""
     result: Optional[Any] = None
     created_at: float = Field(default_factory=time.time)
     error: Optional[ErrorInfo] = None
