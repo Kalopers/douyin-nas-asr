@@ -38,7 +38,7 @@ RUN mkdir -p \
 ENV PYTHONPATH=/app
 
 # 暴露端口（需与 uvicorn --port 一致）
-EXPOSE 17650
+EXPOSE 17649
 
 # 启动命令
-CMD ["uvicorn", "src.server.main:app", "--host", "0.0.0.0", "--port", "17650"]
+CMD ["uvicorn", "src.server.main:app", "--host", "0.0.0.0", "--port", "17649"]
