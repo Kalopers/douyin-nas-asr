@@ -9,8 +9,9 @@ import asyncio
 from loguru import logger
 from typing import Dict, Optional, List
 
+from src.server.job_store import JobStore
+from src.server.models import JobInfo, TaskKind
 from src.server.tasks import BaseTask
-from src.server.models import JobInfo
 from src.server.settings import settings
 
 
@@ -25,11 +26,31 @@ class TaskManager:
 
     def __init__(self):
         self._tasks: Dict[str, BaseTask] = {}
+        self._job_store: Optional[JobStore] = None
 
-    def register(self, task: BaseTask) -> None:
+    def configure_store(self, job_store: JobStore) -> None:
+        self._job_store = job_store
+
+    async def enqueue_job(self, job: JobInfo, task_kind: TaskKind) -> None:
+        if not self._job_store:
+            return
+        await asyncio.to_thread(self._job_store.enqueue_job, job, task_kind)
+
+    async def persist_job(self, job: JobInfo, task_kind: TaskKind) -> None:
+        if not self._job_store:
+            return
+        await asyncio.to_thread(self._job_store.upsert_job, job, task_kind)
+
+    async def register(self, task: BaseTask) -> None:
+        task.attach_persist_hook(self.persist_job)
         self._tasks[task.id] = task
+        await self.persist_job(task.job, task.task_kind)
 
-    def get_job(self, task_id: str) -> Optional[JobInfo]:
+    async def get_job(self, task_id: str) -> Optional[JobInfo]:
+        if self._job_store:
+            job = await asyncio.to_thread(self._job_store.get_job, task_id)
+            if job:
+                return job
         task = self._tasks.get(task_id)
         return task.job if task else None
 
@@ -45,6 +66,7 @@ class TaskManager:
         async with semaphore:
             logger.info(f"Task {task_id} acquired semaphore, starting...")
             await task.run()
+            await self.persist_job(task.job, task.task_kind)
         self.cleanup_old_jobs()
 
     def cleanup_old_jobs(self) -> None:

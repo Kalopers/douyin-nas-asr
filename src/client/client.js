@@ -3,7 +3,7 @@
 // @name:en      Download Douyin Video to NAS
 // @namespace    http://tampermonkey.net/
 // @version      0.4.0
-// @description  适配 FastAPI 后端：按钮实时同步后端任务状态 (Port 17650)
+// @description  适配 FastAPI 后端：按钮实时同步后端任务状态 (Default Port 17650)
 // @author       Kalo
 // @match        *://www.douyin.com/*
 // @grant        GM_xmlhttpRequest
@@ -20,8 +20,9 @@
     // ============================================================
 
     // 1. 你的 NAS 服务器地址 (不需要带 /download 等后缀)
+    // 默认后端端口契约是 APP_PORT=17650。
     // 如果是本地测试，通常是 http://localhost:17650
-    // 如果是 NAS，请填写入局域网 IP 或域名，例如 http://192.168.1.10:17650
+    // 如果是 NAS，请填写局域网 IP 或域名，例如 http://192.168.1.10:17650
     const NAS_SERVER_BASE_URL = 'http://localhost:17650';
 
     // 2. API Key (必须与后端 .env 文件中的 DY_API_KEY 保持一致)

@@ -8,17 +8,22 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import Awaitable, Callable, Optional
 from loguru import logger
 
 from src.server.models import (
     JobInfo,
     TaskStatus,
+    TaskKind,
     ErrorCode,
     ErrorInfo,
     MessageCode,
     MESSAGE_TEMPLATES,
 )
-from src.server.downloader import DouyinDownloader
+from src.server.downloader import (
+    DouyinDownloader,
+    DownloadError,
+)
 from src.server.transcriber import Transcriber
 
 
@@ -31,10 +36,22 @@ class BaseTask(ABC):
 
     def __init__(self, job: JobInfo):
         self.job = job
+        self._persist_hook: Optional[
+            Callable[[JobInfo, TaskKind], Awaitable[None]]
+        ] = None
 
     @property
     def id(self) -> str:
         return self.job.task_id
+
+    def attach_persist_hook(
+        self, hook: Callable[[JobInfo, TaskKind], Awaitable[None]]
+    ) -> None:
+        self._persist_hook = hook
+
+    async def persist_state(self) -> None:
+        if self._persist_hook is not None:
+            await self._persist_hook(self.job, self.task_kind)
 
     def set_message(self, code: MessageCode, **fmt: object) -> None:
         """
@@ -73,6 +90,13 @@ class BaseTask(ABC):
             detail=detail,
         )
 
+    def fail_from_download_error(self, exc: DownloadError) -> None:
+        self.fail(
+            code=exc.error_code,
+            msg_code=exc.message_code,
+            exc=exc,
+        )
+
     @abstractmethod
     async def run(self) -> None:
         """执行任务主体逻辑"""
@@ -83,6 +107,7 @@ class DownloadTask(BaseTask):
     """
     仅下载任务
     """
+    task_kind = TaskKind.DOWNLOAD
 
     def __init__(self, job: JobInfo, video_id: str, downloader: DouyinDownloader):
         super().__init__(job)
@@ -93,21 +118,24 @@ class DownloadTask(BaseTask):
         try:
             self.job.status = TaskStatus.PROCESSING
             self.set_message(MessageCode.DOWNLOAD_RUNNING)
+            await self.persist_state()
 
-            files, urls = await self.downloader.download(self.video_id)
-            logger.debug(f"DownloadTask got files: {files}, urls: {urls}")
+            download_result = await self.downloader.download(self.video_id)
+            logger.debug(
+                f"DownloadTask got files: {download_result.files}, "
+                f"urls: {download_result.download_urls}"
+            )
 
-            if files and urls:
-                self.job.status = TaskStatus.COMPLETED
-                self.job.result = [str(f) for f in files]
-                self.job.download_urls = urls
-                self.set_message(MessageCode.DOWNLOAD_SUCCESS)
-            else:
-                self.fail(
-                    code=ErrorCode.DOWNLOAD_FAILED,
-                    msg_code=MessageCode.DOWNLOAD_FAILED,
-                )
+            self.job.status = TaskStatus.COMPLETED
+            self.job.result = [str(f) for f in download_result.files]
+            self.job.download_urls = download_result.download_urls
+            self.set_message(MessageCode.DOWNLOAD_SUCCESS)
+            await self.persist_state()
 
+        except DownloadError as e:
+            logger.warning(f"Task {self.id} failed with business error: {e}")
+            self.fail_from_download_error(e)
+            await self.persist_state()
         except Exception as e:
             logger.exception(f"Task {self.id} failed")
             self.fail(
@@ -115,12 +143,14 @@ class DownloadTask(BaseTask):
                 msg_code=MessageCode.INTERNAL_ERROR,
                 exc=e,
             )
+            await self.persist_state()
 
 
 class DownloadAndTranscribeTask(BaseTask):
     """
     下载 + 转写 的组合任务
     """
+    task_kind = TaskKind.DOWNLOAD_AND_TRANSCRIBE
 
     def __init__(
         self,
@@ -139,24 +169,21 @@ class DownloadAndTranscribeTask(BaseTask):
             # 1. 下载
             self.job.status = TaskStatus.PROCESSING
             self.set_message(MessageCode.DOWNLOAD_RUNNING)
+            await self.persist_state()
 
-            files, urls = await self.downloader.download(self.video_id)
-
-            if not files:
-                self.fail(
-                    code=ErrorCode.NO_VIDEO_FOUND,
-                    msg_code=MessageCode.DOWNLOAD_FAILED,
-                )
-                return
+            download_result = await self.downloader.download(self.video_id)
+            files = download_result.files
 
             # 2. 转写
             self.set_message(MessageCode.TRANSCRIBE_RUNNING)
+            await self.persist_state()
             transcript_result = ""
 
             for file_path in files:
                 if file_path.suffix.lower() in [".mp4", ".mov", ".mkv"]:
                     try:
-                        transcript_result = await self.transcriber.transcribe(file_path)
+                        transcription = await self.transcriber.transcribe(file_path)
+                        transcript_result = transcription.text
                     except Exception as e:
                         logger.exception(f"Transcribe error in task {self.id}")
                         self.fail(
@@ -164,20 +191,27 @@ class DownloadAndTranscribeTask(BaseTask):
                             msg_code=MessageCode.TRANSCRIBE_FAILED,
                             exc=e,
                         )
+                        await self.persist_state()
                         return
                     break
 
             if transcript_result:
                 self.job.status = TaskStatus.COMPLETED
                 self.job.result = transcript_result
-                self.job.download_urls = urls
+                self.job.download_urls = download_result.download_urls
                 self.set_message(MessageCode.TRANSCRIBE_SUCCESS)
+                await self.persist_state()
             else:
                 self.fail(
                     code=ErrorCode.TRANSCRIBE_EMPTY,
                     msg_code=MessageCode.TRANSCRIBE_EMPTY,
                 )
+                await self.persist_state()
 
+        except DownloadError as e:
+            logger.warning(f"Task {self.id} failed with business error: {e}")
+            self.fail_from_download_error(e)
+            await self.persist_state()
         except Exception as e:
             logger.exception(f"Task {self.id} failed")
             self.fail(
@@ -185,3 +219,4 @@ class DownloadAndTranscribeTask(BaseTask):
                 msg_code=MessageCode.INTERNAL_ERROR,
                 exc=e,
             )
+            await self.persist_state()

@@ -6,8 +6,6 @@
 
 import json
 from loguru import logger
-import os
-import dotenv
 from pathlib import Path
 from time import time
 
@@ -21,14 +19,10 @@ from src.server.settings import settings
 # 请务必修改这里，指向您存放JSON文件的根目录
 JSON_ROOT_DIR = settings.json_dir.resolve()
 
-dotenv.load_dotenv()  # 加载环境变量
-
-DB_USER = os.getenv("DB_USER", "myuser")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/app_data"
+DATABASE_URL = (
+    f"postgresql://{settings.DB_USER}:{settings.DB_PASSWORD}"
+    f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+)
 logger.info(f"使用的数据库连接字符串: {DATABASE_URL}")
 
 # 批量处理的大小，可以根据您的内存和文件数量调整
@@ -47,7 +41,7 @@ def get_db_session():
         return Session()
     except SQLAlchemyError as e:
         logger.error(
-            f"数据库连接失败，请检查DATABASE_URL配置和Docker容器状态。错误: {e}"
+            f"数据库连接失败，请检查 POSTGRES_*（兼容 DB_*）配置和 Docker 容器状态。错误: {e}"
         )
         return None
 

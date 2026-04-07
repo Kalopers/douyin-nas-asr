@@ -18,7 +18,13 @@ fi
 # pip install -r requirements.txt
 
 echo "正在启动 uvicorn 服务..."
-# 启动 uvicorn 服务
-# --host 0.0.0.0 允许局域网访问
 export PYTHONPATH=$PROJECT_ROOT
-python3 -m uvicorn src.server.main:app --host 0.0.0.0 --port 17650 --reload
+
+APP_HOST="$(python3 -c 'from src.server.settings import settings; print(settings.app_host)')"
+APP_PORT="$(python3 -c 'from src.server.settings import settings; print(settings.app_port)')"
+
+echo "使用配置: APP_HOST=$APP_HOST APP_PORT=$APP_PORT"
+
+# 启动 uvicorn 服务
+# host / port 默认值统一由 settings.py 定义
+exec python3 -m uvicorn src.server.main:app --host "$APP_HOST" --port "$APP_PORT" --reload

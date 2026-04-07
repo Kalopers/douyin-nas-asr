@@ -8,6 +8,7 @@ import re
 import os
 import json
 import asyncio
+from dataclasses import dataclass
 import aiohttp
 import traceback
 import pillow_heif
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
 from src.server.json_manager import DataManager
+from src.server.models import ErrorCode, MessageCode
 from src.server.settings import (
     settings,
 )
@@ -78,6 +80,42 @@ def heic_to_jpg(img_path: Path):
         logger.error(f"转换 HEIC 失败: {img_path.name}, 错误: {e}")
 
 
+@dataclass(frozen=True)
+class DownloadResult:
+    files: List[Path]
+    download_urls: List[str]
+
+
+class DownloadError(Exception):
+    error_code = ErrorCode.DOWNLOAD_FAILED
+    message_code = MessageCode.DOWNLOAD_FAILED
+
+
+class InvalidVideoInputError(DownloadError):
+    error_code = ErrorCode.INVALID_VIDEO_INPUT
+    message_code = MessageCode.DOWNLOAD_INVALID_INPUT
+
+
+class VideoNotFoundError(DownloadError):
+    error_code = ErrorCode.NO_VIDEO_FOUND
+    message_code = MessageCode.DOWNLOAD_NOT_FOUND
+
+
+class TikHubAPIError(DownloadError):
+    error_code = ErrorCode.TIKHUB_API_ERROR
+    message_code = MessageCode.DOWNLOAD_UPSTREAM_ERROR
+
+
+class UnsupportedMediaError(DownloadError):
+    error_code = ErrorCode.UNSUPPORTED_MEDIA
+    message_code = MessageCode.DOWNLOAD_UNSUPPORTED_MEDIA
+
+
+class MediaDownloadError(DownloadError):
+    error_code = ErrorCode.DOWNLOAD_FAILED
+    message_code = MessageCode.DOWNLOAD_FAILED
+
+
 # --- 主下载器类 ---
 class DouyinDownloader:
     def __init__(
@@ -110,7 +148,7 @@ class DouyinDownloader:
             return settings.url_api_url, {"share_url": text}, short_code
 
         # 失败直接抛出，由 download 统一捕获
-        raise ValueError(f"无法解析输入文本，请检查格式: {text}")
+        raise InvalidVideoInputError(f"无法解析输入文本，请检查格式: {text}")
 
     async def _fetch_aweme_data(
         self, api_url: str, params: dict, cache_key: str
@@ -141,7 +179,23 @@ class DouyinDownloader:
                         )
                     return data
 
-                raise ValueError(f"API Error: {data.get('message')}")
+                raise TikHubAPIError(
+                    f"TikHub API 返回异常: {data.get('message') or 'unknown error'}"
+                )
+
+        except asyncio.TimeoutError as e:
+            logger.error(f"TikHub API 请求超时: {cache_key}")
+            raise TikHubAPIError("TikHub API 请求超时") from e
+        except aiohttp.ClientResponseError as e:
+            logger.error(
+                f"TikHub API HTTP 错误: status={e.status}, cache_key={cache_key}"
+            )
+            raise TikHubAPIError(f"TikHub API HTTP 错误: {e.status}") from e
+        except aiohttp.ClientError as e:
+            logger.error(f"TikHub API 网络错误: {cache_key}, error={e}")
+            raise TikHubAPIError(f"TikHub API 网络错误: {e}") from e
+        except DownloadError:
+            raise
 
         except Exception as e:
             logger.error(f"数据获取失败: {e}")
@@ -155,8 +209,11 @@ class DouyinDownloader:
         desc = aweme_detail.get("desc") or aweme_detail.get("aweme_id", "untitled")
         return author_name, desc
 
-    async def _download_with_retry(self, url_list: List[str], save_path: Path):
+    async def _download_with_retry(self, url_list: List[str], save_path: Path) -> str:
         """尝试从 URL 列表中下载文件，直到成功或所有链接都失败"""
+        if not url_list:
+            raise MediaDownloadError(f"没有提供可下载的 URL: {save_path.name}")
+
         if save_path.exists():
             logger.info(f"文件已存在，跳过下载: {save_path.name}")
             # 检查是否遗留未转换的 heic
@@ -169,10 +226,7 @@ class DouyinDownloader:
                 )
                 pass
             else:
-                return
-
-        if not url_list:
-            raise ValueError(f"没有提供可下载的 URL: {save_path.name}")
+                return url_list[0]
 
         for i, url in enumerate(url_list):
             try:
@@ -185,7 +239,7 @@ class DouyinDownloader:
                 logger.warning(f"下载链接 #{i + 1} 失败 (URL: {url}). 错误: {e}")
 
         logger.error(f"所有下载链接均失败: {save_path.name}")
-        raise ConnectionError(f"无法从任何可用链接下载文件: {save_path.name}")
+        raise MediaDownloadError(f"无法从任何可用链接下载文件: {save_path.name}")
 
     async def _download_file(self, url: str, save_path: Path):
         """下载单个文件"""
@@ -205,18 +259,16 @@ class DouyinDownloader:
                 save_path.unlink()
             raise
 
-    async def _batch_download(
-        self, tasks_data: List[Tuple[List[str], Path]]
-    ) -> Tuple[List[Path], List[Any]]:
+    async def _batch_download(self, tasks_data: List[Tuple[List[str], Path]]) -> DownloadResult:
         """
         通用并发下载执行器
         Args:
             tasks_data: List of (url_list, save_path)
         Returns:
-            List of saved paths (including those successfully downloaded or already existing)
+            DownloadResult: 唯一成功返回类型
         """
         if not tasks_data:
-            return [], []
+            raise MediaDownloadError("没有需要下载的文件")
 
         tasks = []
         downloaded_paths = []
@@ -228,11 +280,19 @@ class DouyinDownloader:
             tasks.append(self._download_with_retry(url_list, save_path))
 
         # 并发执行
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for save_path, result in zip(downloaded_paths, results):
-                if isinstance(result, Exception):
-                    logger.error(f"下载失败: {save_path.name}, error={result}")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        failed_items: List[str] = []
+        successful_urls: List[str] = []
+        for save_path, result in zip(downloaded_paths, results):
+            if isinstance(result, Exception):
+                logger.error(f"下载失败: {save_path.name}, error={result}")
+                failed_items.append(f"{save_path.name}: {result}")
+            else:
+                successful_urls.append(result)
+
+        if failed_items:
+            raise MediaDownloadError("部分媒体下载失败: " + "; ".join(failed_items))
 
         # 同时考虑 HEIC → JPG 的情况
         final_paths: List[Path] = []
@@ -248,12 +308,17 @@ class DouyinDownloader:
                 if jpg_path.exists():
                     final_paths.append(jpg_path)
 
-        return final_paths, results
+        if not final_paths:
+            raise MediaDownloadError("下载完成但未生成任何文件")
 
-    # --- 核心修改：所有 _process_* 方法现在都返回 List[Path] ---
+        if len(final_paths) != len(downloaded_paths):
+            raise MediaDownloadError("下载完成但部分输出文件缺失")
+
+        return DownloadResult(files=final_paths, download_urls=successful_urls)
+
     async def _process_single_video(
         self, aweme_detail: Dict[str, Any]
-    ) -> Tuple[List[Path], List[Any]]:
+    ) -> DownloadResult:
         """处理类型 4: 单视频"""
         author_name, desc = self._extract_metadata(aweme_detail)
 
@@ -261,7 +326,7 @@ class DouyinDownloader:
         play_addr = aweme_detail.get("video", {}).get("play_addr", {})
         url_list = play_addr.get("url_list")
         if not url_list:
-            raise ValueError("未找到视频播放地址")
+            raise VideoNotFoundError("未找到视频播放地址")
 
         # 构建路径
         filename = f"{_get_safe_filename(desc)}.mp4"
@@ -273,7 +338,7 @@ class DouyinDownloader:
     # --- 3. 合并后的图集/混合处理 (The Unifier) ---
     async def _process_gallery(
         self, aweme_detail: Dict[str, Any], is_mixed: bool = False
-    ) -> Tuple[List[Path], List[Any]]:
+    ) -> DownloadResult:
         """
         统一处理类型 2 (纯图文) 和 42 (混合媒体)
         本质上都是遍历 images 列表，只是混合模式下需要判断每个 item 是视频还是图片。
@@ -281,7 +346,7 @@ class DouyinDownloader:
         author_name, desc = self._extract_metadata(aweme_detail)
         media_list = aweme_detail.get("images")
         if not media_list:
-            raise ValueError("未找到媒体列表 (images)")
+            raise VideoNotFoundError("未找到媒体列表 (images)")
 
         # 确定保存目录 (混合放 video_dir，纯图放 image_dir，或者你可以统一)
         base_root = settings.video_dir if is_mixed else settings.image_dir
@@ -315,10 +380,13 @@ class DouyinDownloader:
             f"正在处理{'混合' if is_mixed else '图文'}作品: {folder_name}, 共 {len(download_tasks)} 个文件"
         )
 
+        if not download_tasks:
+            raise UnsupportedMediaError("媒体列表中没有可下载的文件")
+
         # 委托执行
         return await self._batch_download(download_tasks)
 
-    async def download(self, text: str) -> List[Path]:
+    async def download(self, text: str) -> DownloadResult:
         """
         根据作品 ID/链接 下载的主入口函数 (Refactored)
         """
@@ -331,7 +399,7 @@ class DouyinDownloader:
             aweme_detail = data.get("data", {}).get("aweme_detail")
             if not aweme_detail:
                 logger.warning(f"未获取到作品详情数据: {cache_key}")
-                return []
+                raise VideoNotFoundError(f"未获取到作品详情数据: {cache_key}")
 
             # 3. 路由分发：决定使用哪个处理函数
             media_type = aweme_detail.get("media_type")
@@ -346,19 +414,22 @@ class DouyinDownloader:
             # 优先匹配明确的类型，Fallback 逻辑放在最后
             if is_images:
                 return await self._process_gallery(aweme_detail, is_mixed=False)
-            elif is_mixed:
+            if is_mixed:
                 return await self._process_gallery(aweme_detail, is_mixed=True)
-            elif is_video:
+            if is_video:
                 return await self._process_single_video(aweme_detail)
-            else:
-                logger.error(f"不支持的媒体类型或数据结构未知: {media_type}")
-                return []
+            logger.error(f"不支持的媒体类型或数据结构未知: {media_type}")
+            raise UnsupportedMediaError(
+                f"不支持的媒体类型或数据结构未知: {media_type}"
+            )
 
+        except DownloadError as e:
+            logger.warning(f"下载业务失败 [{text}]: {e}")
+            raise
         except Exception as e:
-            # 依然捕获顶层异常，防止单个任务崩溃影响整个队列（如果是批量下载的话）
-            logger.error(f"下载任务异常 [{text}]: {e}")
+            logger.error(f"下载任务系统异常 [{text}]: {e}")
             logger.debug(traceback.format_exc())
-            return []
+            raise
 
 
 if __name__ == "__main__":

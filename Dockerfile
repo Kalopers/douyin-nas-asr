@@ -40,8 +40,8 @@ RUN mkdir -p \
 # 设置 PYTHONPATH，使得 src.server 等模块可被导入
 ENV PYTHONPATH=/app
 
-# 暴露端口（需与 uvicorn --port 一致）
-EXPOSE 17649
+# 暴露默认端口（实际监听端口由 settings.py / APP_PORT 决定）
+EXPOSE 17650
 
-# 启动命令
-CMD ["uvicorn", "src.server.main:app", "--host", "0.0.0.0", "--port", "17649"]
+# 启动命令：统一从 settings.py 读取 host / port
+CMD ["python", "-m", "src.server.main"]

@@ -1,12 +1,11 @@
-version: "3.9"
-
 services:
-  app:
+  api:
     build: .
-    container_name: douyin-nas-asr-app
+    container_name: douyin-nas-asr-api
     restart: unless-stopped
+    command: ["python", "-m", "src.server.main"]
     ports:
-      - "17650:17650"   # HOST:CONTAINER
+      - "${APP_PORT}:${APP_PORT}"   # HOST:CONTAINER
     env_file:
       - .env
     volumes:
@@ -22,7 +21,36 @@ services:
       # 日志目录
       - ./logs:/app/logs
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/readyz' % os.environ.get('APP_PORT', '17650'))\"",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build: .
+    container_name: douyin-nas-asr-worker
+    restart: unless-stopped
+    command: ["python", "-m", "src.server.worker"]
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src
+      - ./utils:/app/utils
+      - /path/to/your/json_files:/app/data/json
+      - /path/to/your/video_files:/app/data/videos
+      - /path/to/your/image_files:/app/data/images
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
 
   db:
     image: postgres:14-alpine
@@ -34,6 +62,12 @@ services:
       - POSTGRES_DB=${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   postgres_data:

@@ -6,36 +6,32 @@
 
 import sys
 import uuid
+import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-import aiohttp
 from loguru import logger
-from asyncio import Semaphore
 from fastapi import (
     FastAPI,
     HTTPException,
     Depends,
     Header,
-    status,
-    BackgroundTasks,
-    Request,
 )
+from fastapi.responses import JSONResponse
 
 
 from src.server.settings import settings
 from src.server.models import (
     JobInfo,
+    TaskKind,
     TaskStatus,
     DownloadRequest,
     TaskResponse,
     MessageCode,
+    MESSAGE_TEMPLATES,
 )
-from src.server.downloader import DouyinDownloader
-from src.server.transcriber import Transcriber
-from src.server.json_manager import DataManager
+from src.server.job_store import JobStore
 from src.server.task_manager import TaskManager
-from src.server.tasks import DownloadTask, DownloadAndTranscribeTask
 
 
 # ============================================================
@@ -74,39 +70,58 @@ task_manager = TaskManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("FastAPI 应用启动...")
-    app.state.semaphore = Semaphore(3)
-    # 全局 aiohttp session
-    session = aiohttp.ClientSession()
+    job_store = JobStore()
+    task_manager.configure_store(job_store)
+    app.state.job_store = job_store
 
-    # 实例化 DataManager（用于索引与 JSON 缓存）
-    data_manager = DataManager(base_dir=str(settings.json_dir))
-
-    # Downloader：需要 data_manager + tikhub_auth_key
-    downloader = DouyinDownloader(
-        api_key=settings.tikhub_auth_key,
-        session=session,
-        data_manager=data_manager,
-    )
-
-    # Transcriber
-    transcriber = Transcriber()
-
-    # 注入到 app.state
-    app.state.session = session
-    app.state.downloader = downloader
-    app.state.transcriber = transcriber
-    app.state.data_manager = data_manager
-
-    logger.info("Downloader, Transcriber, DataManager 已准备就绪。")
+    logger.info("JobStore 已准备就绪，API 进程仅负责入队和查状态。")
 
     yield
 
     logger.info("FastAPI 应用关闭...")
-    await session.close()
-    logger.info("aiohttp.ClientSession 已关闭。")
+    job_store.dispose()
+    logger.info("JobStore 已关闭。")
 
 
 app = FastAPI(title="Douyin Downloader Service", lifespan=lifespan)
+
+
+def build_readiness_report() -> dict:
+    job_store = getattr(app.state, "job_store", None)
+
+    report = {
+        "status": "ready",
+        "checks": {
+            "database": {"ok": False, "detail": "job store not initialized"},
+            "queue": {"ok": False, "detail": "job store not initialized"},
+            "storage_json_dir": {"ok": False, "detail": "not checked"},
+            "storage_video_dir": {"ok": False, "detail": "not checked"},
+            "storage_image_dir": {"ok": False, "detail": "not checked"},
+        },
+    }
+
+    if job_store is not None:
+        report["checks"].update(job_store.readiness_report())
+
+    storage_checks = {
+        "storage_json_dir": settings.json_dir,
+        "storage_video_dir": settings.video_dir,
+        "storage_image_dir": settings.image_dir,
+    }
+    for check_name, path in storage_checks.items():
+        path_exists = path.exists()
+        path_writable = path_exists and os.access(path, os.W_OK)
+        report["checks"][check_name] = {
+            "ok": path_exists and path.is_dir() and path_writable,
+            "detail": (
+                f"path={path} exists={path_exists} writable={path_writable}"
+            ),
+        }
+
+    if not all(check["ok"] for check in report["checks"].values()):
+        report["status"] = "not_ready"
+
+    return report
 
 
 # ============================================================
@@ -120,30 +135,16 @@ async def verify_api_key(
     return True
 
 
-def get_downloader(request: Request) -> DouyinDownloader:
-    return request.app.state.downloader
-
-
-def get_transcriber(request: Request) -> Transcriber:
-    return request.app.state.transcriber
-
-
-# ============================================================
-# /download → 使用 DownloadTask + TaskManager
-# ============================================================
 @app.post(
     "/download",
     response_model=TaskResponse,
     dependencies=[Depends(verify_api_key)],
 )
 async def handle_download_request(
-    body: DownloadRequest,  # 1. 改名：这是前端传来的 JSON 数据
-    request: Request,  # 2. 新增：这是 FastAPI 的请求对象（包含 app.state）
-    background_tasks: BackgroundTasks,
-    downloader: DouyinDownloader = Depends(get_downloader),
+    body: DownloadRequest,
 ):
     """
-    纯下载也使用 TaskManager 统一管理，返回 task_id，可轮询状态。
+    API 进程只负责创建任务并入队，不直接执行下载主链路。
     """
     task_id = str(uuid.uuid4())
 
@@ -152,21 +153,11 @@ async def handle_download_request(
         status=TaskStatus.PENDING,
         video_id=body.video_id,
     )
-
-    task = DownloadTask(
-        job=job,
-        video_id=body.video_id,
-        downloader=downloader,
-    )
-    task.set_message(MessageCode.DOWNLOAD_PENDING)
-
-    task_manager.register(task)
+    job.message_code = MessageCode.DOWNLOAD_PENDING
+    job.message = MESSAGE_TEMPLATES[MessageCode.DOWNLOAD_PENDING]
+    await task_manager.enqueue_job(job, TaskKind.DOWNLOAD)
 
     logger.info(f"[Download] 任务入队: {task_id} | 视频: {body.video_id}")
-
-    background_tasks.add_task(
-        task_manager.run_task, task_id, request.app.state.semaphore
-    )
 
     return TaskResponse(
         status="queued",
@@ -184,11 +175,7 @@ async def handle_download_request(
     dependencies=[Depends(verify_api_key)],
 )
 async def handle_download_and_transcribe_request(
-    body: DownloadRequest,  # 1. 改名：这是前端传来的 JSON 数据
-    request: Request,  # 2. 新增：这是 FastAPI 的请求对象（包含 app.state）
-    background_tasks: BackgroundTasks,
-    downloader: DouyinDownloader = Depends(get_downloader),
-    transcriber: Transcriber = Depends(get_transcriber),
+    body: DownloadRequest,
 ):
     task_id = str(uuid.uuid4())
 
@@ -197,22 +184,11 @@ async def handle_download_and_transcribe_request(
         status=TaskStatus.PENDING,
         video_id=body.video_id,
     )
-
-    task = DownloadAndTranscribeTask(
-        job=job,
-        video_id=body.video_id,
-        downloader=downloader,
-        transcriber=transcriber,
-    )
-    task.set_message(MessageCode.DOWNLOAD_PENDING)
-
-    task_manager.register(task)
+    job.message_code = MessageCode.DOWNLOAD_PENDING
+    job.message = MESSAGE_TEMPLATES[MessageCode.DOWNLOAD_PENDING]
+    await task_manager.enqueue_job(job, TaskKind.DOWNLOAD_AND_TRANSCRIBE)
 
     logger.info(f"[Download+Transcribe] 任务入队: {task_id} | 视频: {body.video_id}")
-
-    background_tasks.add_task(
-        task_manager.run_task, task_id, request.app.state.semaphore
-    )
 
     return TaskResponse(
         status="queued",
@@ -230,7 +206,7 @@ async def handle_download_and_transcribe_request(
     dependencies=[Depends(verify_api_key)],
 )
 async def get_task_status(task_id: str):
-    job = task_manager.get_job(task_id)
+    job = await task_manager.get_job(task_id)
     if not job:
         raise HTTPException(status_code=404, detail="Task not found or expired")
     return job
@@ -241,7 +217,23 @@ def read_root():
     return {"message": "Douyin Downloader Service is running."}
 
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    report = build_readiness_report()
+    status_code = 200 if report["status"] == "ready" else 503
+    return JSONResponse(status_code=status_code, content=report)
+
+
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=17649)
+    uvicorn.run(
+        "src.server.main:app",
+        host=settings.app_host,
+        port=settings.app_port,
+    )
